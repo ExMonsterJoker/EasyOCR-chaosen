@@ -1,0 +1,114 @@
+# =================================================================================
+# Modernized Configuration for EasyOCR Training
+# =================================================================================
+
+# --- Experiment Settings ---
+# A unique name for this experiment. Logs and models will be saved under this name.
+experiment_name: "TPS-ResNet-BiLSTM-Attn-FineTune-v1"
+# Random seed for reproducibility.
+seed: 1111
+# Path to a saved model to resume training or for fine-tuning. Leave empty to start from scratch.
+saved_model: "./saved_models/TPS-ResNet-BiLSTM-Attn-Seed1111/best_accuracy.pth"
+
+# --- Data Configuration ---
+data:
+  # Paths to your training and validation data (LMDB format).
+  train_data: "all_data/train_data"
+  valid_data: "all_data/valid_data"
+  # List of sub-datasets to use for training.
+  select_data: [""]
+  # Ratio for sampling from each sub-dataset in select_data.
+  batch_ratio: [1.0]
+  # Proportion of the total dataset to use for training (e.g., 0.5 for 50%).
+  total_data_usage_ratio: 0.5
+
+  # Image dimensions and text properties.
+  imgH: 64
+  imgW: 256
+  batch_max_length: 300
+  # The full set of characters your model should recognize.
+  character_list: '0123456789!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~½¼¾⅛⅜⅝⅞ abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  # Set to true if your images are RGB, false for grayscale.
+  rgb: True
+  # If true, disables filtering of images based on character_list and batch_max_length.
+  data_filtering_off: False
+  # Number of worker threads for data loading.
+  workers: 4
+  # Whether to keep the aspect ratio and pad images.
+  PAD: True
+
+# --- Model Architecture Configuration ---
+model:
+  # Transformation Module
+  Transformation:
+    # 'TPS' or 'None'.
+    name: 'TPS'
+    # Number of fiducial points for the TPS transformation.
+    num_fiducial: 20
+    # Backbone for the localization network: 'resnet'.
+    backbone: 'resnet'
+    # Use gradient checkpointing to save memory (at the cost of a small speed reduction).
+    use_checkpoint: False
+    dropout_rate: 0.1
+
+  # Feature Extraction Module
+  FeatureExtraction:
+    # 'VGG', 'RCNN', or 'ResNet'.
+    name: 'ResNet'
+    output_channel: 512
+    # Use Squeeze-and-Excitation blocks in the ResNet backbone.
+    use_se: True
+
+  # Sequence Modeling Module
+  SequenceModeling:
+    # 'BiLSTM', 'Transformer', or 'None'.
+    name: 'BiLSTM'
+    hidden_size: 256
+    # Number of layers in the BiLSTM or Transformer.
+    num_layers: 2
+    dropout: 0.1
+    # Number of attention heads (only for Transformer).
+    num_heads: 8
+
+  # Prediction Module
+  Prediction:
+    # 'CTC' or 'Attn'.
+    name: 'Attn'
+
+# --- Training Hyperparameters ---
+training:
+  # Batch size for training.
+  batch_size: 8
+  # Total number of training iterations.
+  num_iter: 1000
+  # Interval (in iterations) for running validation.
+  valInterval: 500
+  # Set to true to load weights from saved_model and train further.
+  fine_tune: True
+  # Set to true if you are fine-tuning with a different character set.
+  new_prediction_layer: True
+
+  # Optimizer settings
+  optimizer:
+    # 'adam' or 'adadelta'.
+    type: 'adam'
+    lr: 0.0001
+    # Adam-specific parameters.
+    beta1: 0.9
+    # Adadelta-specific parameters.
+    rho: 0.95
+    eps: 1e-8
+
+  # Learning rate scheduler settings
+  scheduler:
+    use: True
+    # e.g., 'StepLR', 'CosineAnnealingLR'.
+    type: 'StepLR'
+    step_size: 3000
+    gamma: 0.1
+
+  # Other training settings
+  # Gradient clipping value to prevent exploding gradients.
+  grad_clip: 5.0
+  # Enable Automatic Mixed Precision (AMP) for faster training on compatible GPUs.
+  amp: True

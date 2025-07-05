@@ -1,323 +1,333 @@
 import os
-import sys
 import re
-import six
-import math
-import torch
+import sys
+import random
+import logging
+from typing import List, Tuple
+
+import numpy as np
+import cv2
+import lmdb
 import pandas as pd
 
-from natsort import natsorted
-from PIL import Image
-import numpy as np
-from torch.utils.data import Dataset, ConcatDataset, Subset
-from itertools import accumulate as _accumulate
-import torchvision.transforms as transforms
+import torch
+from torch.utils.data import Dataset, ConcatDataset, Subset, DataLoader
+from torchvision import transforms
+import torchvision.transforms.functional as TF
+from PIL import Image, ImageOps, ImageEnhance
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def contrast_grey(img):
-    high = np.percentile(img, 90)
-    low = np.percentile(img, 10)
-    return (high - low) / (high + low), high, low
-
-
-def adjust_contrast_grey(img, target=0.4):
-    contrast, high, low = contrast_grey(img)
-    if contrast < target:
-        img = img.astype(int)
-        ratio = 200. / (high - low)
-        img = (img - low + 25) * ratio
-        img = np.maximum(np.full(img.shape, 0), np.minimum(np.full(img.shape, 255), img)).astype(np.uint8)
-    return img
-
-
-class Batch_Balanced_Dataset(object):
+class ModernBatchBalancedDataset:
+    """
+    Modern implementation of a batch-balanced dataset for EasyOCR fine-tuning.
+    Supports multiple data sources with configurable ratios and advanced augmentations.
+    """
 
     def __init__(self, opt):
         """
-        Modulate the data ratio in the batch.
-        For example, when select_data is "MJ-ST" and batch_ratio is "0.5-0.5",
-        the 50% of the batch is filled with MJ and the other 50% of the batch is filled with ST.
+        Args:
+            opt: Configuration object with dataset parameters.
         """
-        log = open(f'./saved_models/{opt.experiment_name}/log_dataset.txt', 'a')
-        dashed_line = '-' * 80
-        print(dashed_line)
-        log.write(dashed_line + '\n')
-        print(f'dataset_root: {opt.train_data}\nopt.select_data: {opt.select_data}\nopt.batch_ratio: {opt.batch_ratio}')
-        log.write(
-            f'dataset_root: {opt.train_data}\nopt.select_data: {opt.select_data}\nopt.batch_ratio: {opt.batch_ratio}\n')
-        assert len(opt.select_data) == len(opt.batch_ratio)
-
-        _AlignCollate = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD,
-                                     contrast_adjust=opt.contrast_adjust)
-        self.data_loader_list = []
-        self.dataloader_iter_list = []
-        batch_size_list = []
-        Total_batch_size = 0
-        for selected_d, batch_ratio_d in zip(opt.select_data, opt.batch_ratio):
-            _batch_size = max(round(opt.batch_size * float(batch_ratio_d)), 1)
-            print(dashed_line)
-            log.write(dashed_line + '\n')
-            _dataset, _dataset_log = hierarchical_dataset(root=opt.train_data, opt=opt, select_data=[selected_d])
-            total_number_dataset = len(_dataset)
-            log.write(_dataset_log)
-
-            """
-            The total number of data can be modified with opt.total_data_usage_ratio.
-            ex) opt.total_data_usage_ratio = 1 indicates 100% usage, and 0.2 indicates 20% usage.
-            See 4.2 section in our paper.
-            """
-            number_dataset = int(total_number_dataset * float(opt.total_data_usage_ratio))
-            dataset_split = [number_dataset, total_number_dataset - number_dataset]
-            indices = range(total_number_dataset)
-            _dataset, _ = [Subset(_dataset, indices[offset - length:offset])
-                           for offset, length in zip(_accumulate(dataset_split), dataset_split)]
-            selected_d_log = f'num total samples of {selected_d}: {total_number_dataset} x {opt.total_data_usage_ratio} (total_data_usage_ratio) = {len(_dataset)}\n'
-            selected_d_log += f'num samples of {selected_d} per batch: {opt.batch_size} x {float(batch_ratio_d)} (batch_ratio) = {_batch_size}'
-            print(selected_d_log)
-            log.write(selected_d_log + '\n')
-            batch_size_list.append(str(_batch_size))
-            Total_batch_size += _batch_size
-
-            _data_loader = torch.utils.data.DataLoader(
-                _dataset, batch_size=_batch_size,
-                shuffle=True,
-                num_workers=int(opt.workers),
-                prefetch_factor=512,
-                collate_fn=_AlignCollate,
-                pin_memory=True,
-                persistent_workers=True
-            )
-            self.data_loader_list.append(_data_loader)
-            self.dataloader_iter_list.append(iter(_data_loader))
-
-        Total_batch_size_log = f'{dashed_line}\n'
-        batch_size_sum = '+'.join(batch_size_list)
-        Total_batch_size_log += f'Total_batch_size: {batch_size_sum} = {Total_batch_size}\n'
-        Total_batch_size_log += f'{dashed_line}'
-        opt.batch_size = Total_batch_size
-
-        print(Total_batch_size_log)
-        log.write(Total_batch_size_log + '\n')
-        log.close()
-
-    # def get_batch(self):
-    #     balanced_batch_images = []
-    #     balanced_batch_texts = []
-
-    #     for i, data_loader_iter in enumerate(self.dataloader_iter_list):
-    #         try:
-    #             for image, text in data_loader_iter:
-    #                 balanced_batch_images.append(image)
-    #                 balanced_batch_texts += text
-    #         except StopIteration:
-    #             data_loader_iter = iter(self.data_loader)
-    #             self.dataloader_iter_list[i] = data_loader_iter
-
-    #     return torch.cat(balanced_batch_images, 0), balanced_batch_texts
-
-    def get_batch(self):
-        balanced_batch_images = []
-        balanced_batch_texts = []
-
-        for i, data_loader_iter in enumerate(self.dataloader_iter_list):
-            try:
-                image, text = next(data_loader_iter)  # Changed from data_loader_iter.next()
-                balanced_batch_images.append(image)
-                balanced_batch_texts += text
-            except StopIteration:
-                self.dataloader_iter_list[i] = iter(self.data_loader_list[i])
-                image, text = next(self.dataloader_iter_list[i])  # Changed from self.dataloader_iter_list[i].next()
-                balanced_batch_images.append(image)
-                balanced_batch_texts += text
-            except ValueError:
-                pass
-
-        balanced_batch_images = torch.cat(balanced_batch_images, 0)
-
-        return balanced_batch_images, balanced_batch_texts
-
-    # def get_batch(self):
-    #     balanced_batch_images = []
-    #     balanced_batch_texts = []
-
-    #     for data_loader_iter in self.dataloader_iter_list:
-    #         for image, text in data_loader_iter:
-    #             balanced_batch_images.append(image)
-    #             balanced_batch_texts += text
-
-    #     balanced_batch_images = torch.cat(balanced_batch_images, 0)
-
-    #     return balanced_batch_images, balanced_batch_texts
-
-
-def hierarchical_dataset(root, opt, select_data='/'):
-    """ select_data='/' contains all sub-directory of root directory """
-    dataset_list = []
-    dataset_log = f'dataset_root:    {root}\t dataset: {select_data[0]}'
-    print(dataset_log)
-    dataset_log += '\n'
-    for dirpath, dirnames, filenames in os.walk(root + '/'):
-        if not dirnames:
-            select_flag = False
-            for selected_d in select_data:
-                if selected_d in dirpath:
-                    select_flag = True
-                    break
-
-            if select_flag:
-                dataset = OCRDataset(dirpath, opt)
-                sub_dataset_log = f'sub-directory:\t/{os.path.relpath(dirpath, root)}\t num samples: {len(dataset)}'
-                print(sub_dataset_log)
-                dataset_log += f'{sub_dataset_log}\n'
-                dataset_list.append(dataset)
-
-    concatenated_dataset = ConcatDataset(dataset_list)
-
-    return concatenated_dataset, dataset_log
-
-
-class OCRDataset(Dataset):
-
-    def __init__(self, root, opt):
-
-        self.root = root
         self.opt = opt
-        print(root)
-        #         self.df = pd.read_csv(os.path.join(root,'labels.csv'), sep='^([^,]+),', engine='python', usecols=['filename', 'words'], keep_default_na=False)
-        self.df = pd.read_csv(os.path.join(root, 'labels.csv'), sep=',', engine='python', usecols=['filename', 'words'],
-                              keep_default_na=False)
-        self.nSamples = len(self.df)
+        self.data_loaders = []
+        self.dataset_iterators = []
 
-        if self.opt.data_filtering_off:
-            self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
+        # Create log directory if it doesn't exist
+        log_dir = f'./saved_models/{opt.experiment_name}'
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = open(f'{log_dir}/log_dataset.txt', 'a', encoding='utf-8')
+
+        self._initialize_datasets()
+
+    def _initialize_datasets(self):
+        """Initialize all datasets and their corresponding data loaders."""
+        self.log_file.write('-' * 80 + '\n')
+        self.log_file.write(f'Dataset Configuration:\n')
+        self.log_file.write(f'Train data root: {self.opt.train_data}\n')
+        self.log_file.write(f'Select data: {self.opt.select_data}\n')
+        self.log_file.write(f'Batch ratio: {self.opt.batch_ratio}\n')
+        self.log_file.write('-' * 80 + '\n')
+
+        all_datasets = []
+        for dataset_name in self.opt.select_data:
+            dataset = self._create_dataset(dataset_name)
+            all_datasets.append(dataset)
+
+        # Create a single concatenated dataset
+        concatenated_dataset = ConcatDataset(all_datasets)
+
+        # Create a single data loader for the concatenated dataset
+        self.data_loader = DataLoader(
+            concatenated_dataset,
+            batch_size=self.opt.batch_size,
+            shuffle=True,
+            num_workers=int(self.opt.workers),
+            collate_fn=ModernAlignCollate(
+                imgH=self.opt.imgH,
+                imgW=self.opt.imgW,
+                keep_ratio_with_pad=self.opt.PAD,
+                augmentation=getattr(self.opt, 'augmentation', True)
+            ),
+            pin_memory=True,
+            persistent_workers=True if int(self.opt.workers) > 0 else False,
+            drop_last=True
+        )
+        self.dataset_iterator = iter(self.data_loader)
+        logger.info(f"Total training samples: {len(concatenated_dataset)}")
+        self.log_file.write(f"Total training samples: {len(concatenated_dataset)}\n")
+
+    def _create_dataset(self, dataset_name: str) -> Dataset:
+        """Create dataset based on the dataset name/path."""
+        dataset_path = os.path.join(self.opt.train_data, dataset_name)
+
+        if os.path.isdir(dataset_path) and 'data.mdb' in os.listdir(dataset_path):
+            logger.info(f"Loading LMDB dataset from: {dataset_path}")
+            return ModernLmdbDataset(dataset_path, self.opt)
+        elif os.path.isfile(os.path.join(dataset_path, 'labels.csv')):
+            logger.info(f"Loading CSV-based dataset from: {dataset_path}")
+            return ModernOCRDataset(dataset_path, self.opt)
         else:
-            self.filtered_index_list = []
-            for index in range(self.nSamples):
-                label = self.df.at[index, 'words']
-                try:
-                    if len(label) > self.opt.batch_max_length:
-                        continue
-                except:
-                    print(label)
-                out_of_char = f'[^{self.opt.character}]'
-                if re.search(out_of_char, label.lower()):
-                    continue
-                self.filtered_index_list.append(index)
-            self.nSamples = len(self.filtered_index_list)
+            raise ValueError(f"Unknown or invalid dataset format for {dataset_path}")
+
+    def get_batch(self) -> Tuple[torch.Tensor, List[str]]:
+        """Get a batch from the data loader."""
+        try:
+            images, labels = next(self.dataset_iterator)
+        except StopIteration:
+            # Restart iterator
+            self.dataset_iterator = iter(self.data_loader)
+            images, labels = next(self.dataset_iterator)
+        except Exception as e:
+            logger.error(f"Error getting batch: {e}")
+            raise RuntimeError("Could not retrieve a valid batch.") from e
+        return images, labels
 
     def __len__(self):
-        return self.nSamples
+        return len(self.data_loader)
 
-    def __getitem__(self, index):
-        index = self.filtered_index_list[index]
-        img_fname = self.df.at[index, 'filename']
-        img_fpath = os.path.join(self.root, img_fname)
-        label = self.df.at[index, 'words']
+    def __del__(self):
+        """Cleanup."""
+        if hasattr(self, 'log_file'):
+            self.log_file.close()
 
-        if self.opt.rgb:
-            img = Image.open(img_fpath).convert('RGB')  # for color image
-        else:
-            img = Image.open(img_fpath).convert('L')
 
-        if not self.opt.sensitive:
+class ModernLmdbDataset(Dataset):
+    """Modern LMDB dataset implementation with better error handling."""
+
+    def __init__(self, root: str, opt):
+        self.root = root
+        self.opt = opt
+
+        try:
+            self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
+        except lmdb.Error as e:
+            logger.error(f'Cannot create LMDB from {root}: {e}')
+            raise
+
+        with self.env.begin(write=False) as txn:
+            self.nSamples = int(txn.get('num-samples'.encode()).decode())
+            self.filtered_index_list = self._filter_samples(txn)
+
+        logger.info(
+            f'LMDB Dataset {os.path.basename(root)}: {len(self.filtered_index_list)}/{self.nSamples} samples loaded.')
+
+    def _filter_samples(self, txn) -> List[int]:
+        """Filter samples based on length and character constraints."""
+        filtered_indices = []
+        for index in range(1, self.nSamples + 1):  # LMDB is 1-indexed
+            label_key = f'label-{index:09d}'.encode()
+            label_bytes = txn.get(label_key)
+            if label_bytes is None:
+                continue
+            label = label_bytes.decode('utf-8')
+
+            if len(label) > self.opt.batch_max_length or len(label) == 0:
+                continue
+
+            if not self.opt.data_filtering_off and hasattr(self.opt, 'character'):
+                pattern = f'[^{re.escape(self.opt.character)}]'
+                if re.search(pattern, label.lower()):
+                    continue
+
+            filtered_indices.append(index)
+        return filtered_indices
+
+    def __len__(self) -> int:
+        return len(self.filtered_index_list)
+
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, str]:
+        real_index = self.filtered_index_list[index]
+        with self.env.begin(write=False) as txn:
+            label_key = f'label-{real_index:09d}'.encode()
+            label = txn.get(label_key).decode('utf-8')
+            img_key = f'image-{real_index:09d}'.encode()
+            imgbuf = txn.get(img_key)
+
+            buf = np.frombuffer(imgbuf, dtype=np.uint8)
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"Cannot decode image at index {real_index} in {self.root}")
+
+            if self.opt.rgb:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        if not getattr(self.opt, 'sensitive', True):
             label = label.lower()
 
-        # We only train and evaluate on alphanumerics (or pre-defined character set in train.py)
-        out_of_char = f'[^{self.opt.character}]'
-        label = re.sub(out_of_char, '', label)
-
-        return (img, label)
+        return img, label
 
 
-class ResizeNormalize(object):
+class ModernOCRDataset(Dataset):
+    """Modern CSV-based OCR dataset implementation."""
 
-    def __init__(self, size, interpolation=Image.BICUBIC):
-        self.size = size
-        self.interpolation = interpolation
-        self.toTensor = transforms.ToTensor()
+    def __init__(self, root: str, opt):
+        self.root = root
+        self.opt = opt
+        csv_path = os.path.join(root, 'labels.csv')
+        try:
+            self.df = pd.read_csv(csv_path, sep=',', engine='python', usecols=['filename', 'words'],
+                                  keep_default_na=False)
+        except Exception as e:
+            logger.error(f"Cannot load CSV from {csv_path}: {e}")
+            raise
 
-    def __call__(self, img):
-        img = img.resize(self.size, self.interpolation)
-        img = self.toTensor(img)
-        img.sub_(0.5).div_(0.5)
-        return img
+        self.filtered_df = self._filter_samples()
+        logger.info(f'CSV Dataset {os.path.basename(root)}: {len(self.filtered_df)}/{len(self.df)} samples loaded.')
+
+    def _filter_samples(self) -> pd.DataFrame:
+        """Filter samples based on constraints."""
+        df = self.df.copy()
+        df = df[df['words'].str.len() <= self.opt.batch_max_length]
+        df = df[df['words'].str.len() > 0]
+
+        if not self.opt.data_filtering_off and hasattr(self.opt, 'character'):
+            pattern = f'[^{re.escape(self.opt.character)}]'
+            df = df[~df['words'].str.lower().str.contains(pattern, regex=True)]
+
+        return df.reset_index(drop=True)
+
+    def __len__(self) -> int:
+        return len(self.filtered_df)
+
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, str]:
+        row = self.filtered_df.iloc[index]
+        img_fname = row['filename']
+        img_fpath = os.path.join(self.root, 'images', img_fname)
+        label = row['words']
+
+        try:
+            if self.opt.rgb:
+                img = cv2.imread(img_fpath)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                img = cv2.imread(img_fpath, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise ValueError(f"Cannot load image: {img_fpath}")
+        except Exception as e:
+            logger.error(f"Error loading image {img_fpath}: {e}")
+            # Return a placeholder to be filtered by collate_fn
+            return None, ""
+
+        if not getattr(self.opt, 'sensitive', True):
+            label = label.lower()
+
+        return img, label
 
 
-class NormalizePAD(object):
+class ModernAlignCollate:
+    """Modern collate function with advanced augmentations using Albumentations."""
 
-    def __init__(self, max_size, PAD_type='right'):
-        self.toTensor = transforms.ToTensor()
-        self.max_size = max_size
-        self.max_width_half = math.floor(max_size[2] / 2)
-        self.PAD_type = PAD_type
-
-    def __call__(self, img):
-        img = self.toTensor(img)
-        img.sub_(0.5).div_(0.5)
-        c, h, w = img.size()
-        Pad_img = torch.FloatTensor(*self.max_size).fill_(0)
-        Pad_img[:, :, :w] = img  # right pad
-        if self.max_size[2] != w:  # add border Pad
-            Pad_img[:, :, w:] = img[:, :, w - 1].unsqueeze(2).expand(c, h, self.max_size[2] - w)
-
-        return Pad_img
-
-
-class AlignCollate(object):
-
-    def __init__(self, imgH=32, imgW=100, keep_ratio_with_pad=False, contrast_adjust=0.):
+    def __init__(self, imgH: int = 32, imgW: int = 100, keep_ratio_with_pad: bool = False, augmentation: bool = True):
         self.imgH = imgH
         self.imgW = imgW
         self.keep_ratio_with_pad = keep_ratio_with_pad
-        self.contrast_adjust = contrast_adjust
+        self.augmentation = augmentation
 
-    def __call__(self, batch):
-        batch = filter(lambda x: x is not None, batch)
+        # Common transforms
+        self.normalize = A.Normalize(mean=[0.5], std=[0.5])
+
+        # Augmentation pipeline
+        if augmentation:
+            self.augment = A.Compose([
+                A.OneOf([
+                    A.MotionBlur(blur_limit=5, p=0.5),
+                    A.GaussianBlur(blur_limit=5, p=0.5),
+                    A.GlassBlur(sigma=0.2, max_delta=2, p=0.3),
+                ], p=0.4),
+                A.OneOf([
+                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+                    A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=0.4),
+                ], p=0.5),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+                A.Perspective(scale=(0.02, 0.08), pad_mode=cv2.BORDER_REPLICATE, p=0.4),
+                A.Affine(scale=(0.8, 1.2), translate_percent=(-0.1, 0.1), rotate=(-5, 5), shear=(-5, 5), p=0.5),
+                self.normalize,
+                ToTensorV2()
+            ])
+        else:
+            self.augment = A.Compose([
+                self.normalize,
+                ToTensorV2()
+            ])
+
+    def __call__(self, batch: List[Tuple[np.ndarray, str]]) -> Tuple[torch.Tensor, List[str]]:
+        # Filter out None samples from failed __getitem__ calls
+        batch = [sample for sample in batch if sample[0] is not None]
+        if not batch:
+            # Return empty tensors if the whole batch failed
+            return torch.Tensor(), []
+
         images, labels = zip(*batch)
 
-        if self.keep_ratio_with_pad:  # same concept with 'Rosetta' paper
-            resized_max_w = self.imgW
-            input_channel = 3 if images[0].mode == 'RGB' else 1
-            transform = NormalizePAD((input_channel, self.imgH, resized_max_w))
+        processed_images = []
+        for img in images:
+            if self.keep_ratio_with_pad:
+                h, w = img.shape[:2]
+                ratio = w / h
+                new_w = int(ratio * self.imgH)
 
-            resized_images = []
-            for image in images:
-                w, h = image.size
+                # Resize and apply augmentations
+                resize_aug = A.Compose([
+                    A.Resize(height=self.imgH, width=new_w),
+                    self.augment.transforms[0]  # Apply augmentations before padding
+                ])
+                processed = resize_aug(image=img)['image']
 
-                #### augmentation here - change contrast
-                if self.contrast_adjust > 0:
-                    image = np.array(image.convert("L"))
-                    image = adjust_contrast_grey(image, target=self.contrast_adjust)
-                    image = Image.fromarray(image, 'L')
+                # Pad to target width
+                c, h, w = processed.shape
+                pad_width = self.imgW - w
+                if pad_width > 0:
+                    processed = TF.pad(processed, [0, 0, pad_width, 0], fill=0)
+                elif pad_width < 0:  # If wider than target, resize again
+                    processed = TF.resize(processed, [self.imgH, self.imgW])
 
-                ratio = w / float(h)
-                if math.ceil(self.imgH * ratio) > self.imgW:
-                    resized_w = self.imgW
-                else:
-                    resized_w = math.ceil(self.imgH * ratio)
+                processed_images.append(processed)
+            else:
+                # Resize directly to target size and augment
+                resize_aug = A.Compose([
+                    A.Resize(height=self.imgH, width=self.imgW),
+                    self.augment
+                ])
+                processed = resize_aug(image=img)['image']
+                processed_images.append(processed)
 
-                resized_image = image.resize((resized_w, self.imgH), Image.BICUBIC)
-                resized_images.append(transform(resized_image))
-                # resized_image.save('./image_test/%d_test.jpg' % w)
-
-            image_tensors = torch.cat([t.unsqueeze(0) for t in resized_images], 0)
-
-        else:
-            transform = ResizeNormalize((self.imgW, self.imgH))
-            image_tensors = [transform(image) for image in images]
-            image_tensors = torch.cat([t.unsqueeze(0) for t in image_tensors], 0)
-
-        return image_tensors, labels
-
-
-def tensor2im(image_tensor, imtype=np.uint8):
-    image_numpy = image_tensor.cpu().float().numpy()
-    if image_numpy.shape[0] == 1:
-        image_numpy = np.tile(image_numpy, (3, 1, 1))
-    image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
-    return image_numpy.astype(imtype)
+        image_tensors = torch.stack(processed_images)
+        return image_tensors, list(labels)
 
 
-def save_image(image_numpy, image_path):
-    image_pil = Image.fromarray(image_numpy)
-    image_pil.save(image_path)
+# Legacy compatibility functions
+def hierarchical_dataset(root, opt):
+    return ModernOCRDataset(root, opt), ""  # Simplified for modern use
+
+
+Batch_Balanced_Dataset = ModernBatchBalancedDataset
+AlignCollate = ModernAlignCollate

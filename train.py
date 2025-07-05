@@ -1,290 +1,238 @@
 import os
-import sys
+import yaml
 import time
 import random
+import argparse
+import logging
+from pathlib import Path
+
 import torch
-import torch.backends.cudnn as cudnn
 import torch.nn as nn
-import torch.nn.init as init
 import torch.optim as optim
 import torch.utils.data
-from torch.amp import autocast, GradScaler
-import numpy as np
-
-from utils import CTCLabelConverter, AttnLabelConverter, Averager
+import torch.backends.cudnn as cudnn
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+from typing import Tuple, Union
+from utils import CTCLabelConverter, AttnLabelConverter, Averager, AttrDict
 from dataset import hierarchical_dataset, AlignCollate, Batch_Balanced_Dataset
-from model import Model
+from model import ModernizedOCRModel as Model
 from test import validation
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-if torch.cuda.is_available():
-    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"Device count: {torch.cuda.device_count()}")
 
-def count_parameters(model):
-    print("Modules, Parameters")
-    total_params = 0
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad: continue
-        param = parameter.numel()
-        #table.add_row([name, param])
-        total_params+=param
-        print(name, param)
-    print(f"Total Trainable Params: {total_params}")
-    return total_params
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def train(opt, show_number = 2, amp=False):
-    """ dataset preparation """
-    if not opt.data_filtering_off:
-        print('Filtering the images containing characters which are not in opt.character')
-        print('Filtering the images whose label is longer than opt.batch_max_length')
 
-    opt.select_data = opt.select_data.split('-')
-    opt.batch_ratio = opt.batch_ratio.split('-')
-    train_dataset = Batch_Balanced_Dataset(opt)
+def load_config(config_path: str) -> AttrDict:
+    """Load configuration from a YAML file."""
+    # Corrected to specify UTF-8 encoding to prevent UnicodeDecodeError on Windows.
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config_dict = yaml.safe_load(f)
+    return AttrDict(config_dict)
 
-    log = open(f'./saved_models/{opt.experiment_name}/log_dataset.txt', 'a', encoding="utf8")
-    AlignCollate_valid = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD, contrast_adjust=opt.contrast_adjust)
-    valid_dataset, valid_dataset_log = hierarchical_dataset(root=opt.valid_data, opt=opt)
+
+def setup_device_and_seed(config: AttrDict):
+    """Set up device and random seeds for reproducibility."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.seed)
+        cudnn.benchmark = True
+        cudnn.deterministic = True
+    logger.info(f"Using device: {device}")
+    return device
+
+
+def setup_data_loaders(config: AttrDict) -> Tuple[Batch_Balanced_Dataset, torch.utils.data.DataLoader, dict]:
+    """Set up training and validation data loaders."""
+    # Create a temporary config object for the dataset module
+    # This is needed because the original dataset classes expect an opt object
+    data_opt = AttrDict({
+        'experiment_name': config.experiment_name,  # Added this line to fix the error
+        'train_data': config.data.train_data,
+        'select_data': config.data.select_data,
+        'batch_ratio': config.data.batch_ratio,
+        'total_data_usage_ratio': config.data.total_data_usage_ratio,
+        'batch_size': config.training.batch_size,
+        'workers': config.data.workers,
+        'imgH': config.data.imgH,
+        'imgW': config.data.imgW,
+        'rgb': config.data.rgb,
+        'character': config.data.character_list,
+        'batch_max_length': config.data.batch_max_length,
+        'data_filtering_off': config.data.data_filtering_off,
+        'PAD': config.data.PAD,
+        'Transformation': config.model.Transformation.name,
+        'FeatureExtraction': config.model.FeatureExtraction.name,
+        'SequenceModeling': config.model.SequenceModeling.name,
+        'Prediction': config.model.Prediction.name,
+        'num_fiducial': config.model.Transformation.num_fiducial,
+        'input_channel': 3 if config.data.rgb else 1,
+        'output_channel': config.model.FeatureExtraction.output_channel,
+        'hidden_size': config.model.SequenceModeling.hidden_size,
+    })
+
+    train_dataset = Batch_Balanced_Dataset(data_opt)
+
+    AlignCollate_valid = AlignCollate(imgH=data_opt.imgH, imgW=data_opt.imgW, keep_ratio_with_pad=data_opt.PAD)
+    valid_dataset, _ = hierarchical_dataset(root=config.data.valid_data, opt=data_opt)
     valid_loader = torch.utils.data.DataLoader(
-        valid_dataset, batch_size=min(32, opt.batch_size),
-        shuffle=True,
-        num_workers=int(opt.workers),
-        prefetch_factor=512,
-        collate_fn=AlignCollate_valid,
-        pin_memory=True,
-        persistent_workers=True
-    )
-    log.write(valid_dataset_log)
-    print('-' * 80)
-    log.write('-' * 80 + '\n')
-    log.close()
-    
-    """ model configuration """
-    if 'CTC' in opt.Prediction:
-        converter = CTCLabelConverter(opt.character)
-    else:
-        converter = AttnLabelConverter(opt.character)
-    opt.num_class = len(converter.character)
+        valid_dataset, batch_size=config.training.batch_size,
+        shuffle=True, num_workers=int(config.data.workers),
+        collate_fn=AlignCollate_valid, pin_memory=True)
 
-    if opt.rgb:
-        opt.input_channel = 3
-    model = Model(opt)
-    print('model input parameters', opt.imgH, opt.imgW, opt.num_fiducial, opt.input_channel, opt.output_channel,
-          opt.hidden_size, opt.num_class, opt.batch_max_length, opt.Transformation, opt.FeatureExtraction,
-          opt.SequenceModeling, opt.Prediction)
+    logger.info(f"Train dataset size: {len(train_dataset)}")
+    logger.info(f"Validation dataset size: {len(valid_dataset)}")
 
-    if opt.saved_model != '':
-        pretrained_dict = torch.load(opt.saved_model)
-        if opt.new_prediction:
-            model.Prediction = nn.Linear(model.SequenceModeling_output, len(pretrained_dict['module.Prediction.weight']))  
-        
-        model = torch.nn.DataParallel(model).to(device) 
-        print(f'loading pretrained model from {opt.saved_model}')
-        if opt.FT:
-            model.load_state_dict(pretrained_dict, strict=False)
-        else:
-            model.load_state_dict(pretrained_dict)
-        if opt.new_prediction:
-            model.module.Prediction = nn.Linear(model.module.SequenceModeling_output, opt.num_class)  
-            for name, param in model.module.Prediction.named_parameters():
-                if 'bias' in name:
-                    init.constant_(param, 0.0)
-                elif 'weight' in name:
-                    init.kaiming_normal_(param)
-            model = model.to(device) 
+    return train_dataset, valid_loader, data_opt
+
+
+def setup_model(config: AttrDict, data_opt: AttrDict, device: torch.device) -> Tuple[
+    nn.Module, Union[CTCLabelConverter, AttnLabelConverter]]:
+    """Set up the OCR model."""
+    if 'CTC' in config.model.Prediction.name:
+        converter = CTCLabelConverter(config.data.character_list)
     else:
-        # weight initialization
-        for name, param in model.named_parameters():
-            if 'localization_fc2' in name:
-                print(f'Skip {name} as it is already initialized')
-                continue
-            try:
-                if 'bias' in name:
-                    init.constant_(param, 0.0)
-                elif 'weight' in name:
-                    init.kaiming_normal_(param)
-            except Exception as e:  # for batchnorm.
-                if 'weight' in name:
-                    param.data.fill_(1)
-                continue
-        model = torch.nn.DataParallel(model).to(device)
-    
-    model.train() 
-    print("Model:")
-    print(model)
-    count_parameters(model)
-    
-    """ setup loss """
-    if 'CTC' in opt.Prediction:
-        criterion = torch.nn.CTCLoss(zero_infinity=True).to(device)
-    else:
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
-    # loss averager
+        converter = AttnLabelConverter(config.data.character_list)
+
+    data_opt.num_class = len(converter.character)
+
+    model = Model(data_opt).to(device)
+
+    # Load pretrained model if specified
+    if config.saved_model:
+        logger.info(f"Loading model from {config.saved_model}")
+        model.load_state_dict(torch.load(config.saved_model, map_location=device), strict=not config.training.fine_tune)
+
+    return model, converter
+
+
+def train_one_epoch(model, criterion, optimizer, scaler, train_dataset, device, converter, config, writer,
+                    current_iter):
+    """Train the model for one epoch."""
+    model.train()
     loss_avg = Averager()
 
-    # freeze some layers
-    try:
-        if opt.freeze_FeatureFxtraction:
-            for param in model.module.FeatureExtraction.parameters():
-                param.requires_grad = False
-        if opt.freeze_SequenceModeling:
-            for param in model.module.SequenceModeling.parameters():
-                param.requires_grad = False
-    except:
-        pass
-    
-    # filter that only require gradient decent
-    filtered_parameters = []
-    params_num = []
-    for p in filter(lambda p: p.requires_grad, model.parameters()):
-        filtered_parameters.append(p)
-        params_num.append(np.prod(p.size()))
-    print('Trainable params num : ', sum(params_num))
-    # [print(name, p.numel()) for name, p in filter(lambda p: p[1].requires_grad, model.named_parameters())]
+    num_batches = len(train_dataset) // config.training.batch_size
+    pbar = tqdm(range(num_batches), desc=f"Training Iter {current_iter}-{current_iter + num_batches}", leave=False)
 
-    # setup optimizer
-    if opt.optim=='adam':
-        #optimizer = optim.Adam(filtered_parameters, lr=opt.lr, betas=(opt.beta1, 0.999))
-        optimizer = optim.Adam(filtered_parameters)
-    else:
-        optimizer = optim.Adadelta(filtered_parameters, lr=opt.lr, rho=opt.rho, eps=opt.eps)
-    print("Optimizer:")
-    print(optimizer)
+    for i in pbar:
+        image_tensors, labels = train_dataset.get_batch()
+        image = image_tensors.to(device)
+        text, length = converter.encode(labels, batch_max_length=config.data.batch_max_length)
+        text = text.to(device)
+        length = length.to(device)
 
-    """ final options """
-    # print(opt)
-    with open(f'./saved_models/{opt.experiment_name}/opt.txt', 'a', encoding="utf8") as opt_file:
-        opt_log = '------------ Options -------------\n'
-        args = vars(opt)
-        for k, v in args.items():
-            opt_log += f'{str(k)}: {str(v)}\n'
-        opt_log += '---------------------------------------\n'
-        print(opt_log)
-        opt_file.write(opt_log)
-
-    """ start training """
-    start_iter = 0
-    if opt.saved_model != '':
-        try:
-            start_iter = int(opt.saved_model.split('_')[-1].split('.')[0])
-            print(f'continue to train, start_iter: {start_iter}')
-        except:
-            pass
-
-    start_time = time.time()
-    best_accuracy = -1
-    best_norm_ED = -1
-    i = start_iter
-
-    scaler = GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
-    t1= time.time()
-        
-    while(True):
-        # train part
         optimizer.zero_grad(set_to_none=True)
 
-        if amp:
-            with autocast(device_type='cuda'):
-                image_tensors, labels = train_dataset.get_batch()
-                image = image_tensors.to(device)
-                text, length = converter.encode(labels, batch_max_length=opt.batch_max_length)
-                batch_size = image.size(0)
-
-                if 'CTC' in opt.Prediction:
-                    preds = model(image, text).log_softmax(2)
-                    preds_size = torch.IntTensor([preds.size(1)] * batch_size)
-                    preds = preds.permute(1, 0, 2)
-                    torch.backends.cudnn.enabled = False
-                    cost = criterion(preds, text.to(device), preds_size.to(device), length.to(device))
-                    torch.backends.cudnn.enabled = True
-                else:
-                    preds = model(image, text[:, :-1])  # align with Attention.forward
-                    target = text[:, 1:]  # without [GO] Symbol
-                    cost = criterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
-            scaler.scale(cost).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            image_tensors, labels = train_dataset.get_batch()
-            image = image_tensors.to(device)
-            text, length = converter.encode(labels, batch_max_length=opt.batch_max_length)
-            batch_size = image.size(0)
-            if 'CTC' in opt.Prediction:
-                preds = model(image, text).log_softmax(2)
-                preds_size = torch.IntTensor([preds.size(1)] * batch_size)
-                preds = preds.permute(1, 0, 2)
-                torch.backends.cudnn.enabled = False
-                cost = criterion(preds, text.to(device), preds_size.to(device), length.to(device))
-                torch.backends.cudnn.enabled = True
+        with autocast(enabled=config.training.amp):
+            if 'CTC' in config.model.Prediction.name:
+                preds = model(image, text)
+                preds_size = torch.IntTensor([preds.size(1)] * image.size(0)).to(device)
+                cost = criterion(preds.log_softmax(2).permute(1, 0, 2), text, preds_size, length)
             else:
-                preds = model(image, text[:, :-1])  # align with Attention.forward
-                target = text[:, 1:]  # without [GO] Symbol
+                preds = model(image, text[:, :-1])  # teacher forcing
+                target = text[:, 1:]
                 cost = criterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
-            cost.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
-            optimizer.step()
 
-        # validation part
-        if (i % opt.valInterval == 0) and (i!=0):
-            print('training time: ', time.time()-t1)
-            t1=time.time()
-            elapsed_time = time.time() - start_time
-            # for log
-            with open(f'./saved_models/{opt.experiment_name}/log_train.txt', 'a', encoding="utf8") as log:
-                model.eval()
-                with torch.no_grad():
-                    valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels,\
-                    infer_time, length_of_data = validation(model, criterion, valid_loader, converter, opt, device)
-                model.train()
+        scaler.scale(cost).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
 
-                # training loss and validation loss
-                loss_log = f'[{i}/{opt.num_iter}] Train loss: {loss_avg.val():0.5f}, Valid loss: {valid_loss:0.5f}, Elapsed_time: {elapsed_time:0.5f}'
-                loss_avg.reset()
+        loss_avg.add(cost)
+        pbar.set_postfix(loss=f"{loss_avg.val:.4f}")
+        writer.add_scalar('Loss/train_iter', loss_avg.val, current_iter + i)
 
-                current_model_log = f'{"Current_accuracy":17s}: {current_accuracy:0.3f}, {"Current_norm_ED":17s}: {current_norm_ED:0.4f}'
+    return current_iter + num_batches
 
-                # keep best accuracy model (on valid dataset)
-                if current_accuracy > best_accuracy:
-                    best_accuracy = current_accuracy
-                    torch.save(model.state_dict(), f'./saved_models/{opt.experiment_name}/best_accuracy.pth')
-                if current_norm_ED > best_norm_ED:
-                    best_norm_ED = current_norm_ED
-                    torch.save(model.state_dict(), f'./saved_models/{opt.experiment_name}/best_norm_ED.pth')
-                best_model_log = f'{"Best_accuracy":17s}: {best_accuracy:0.3f}, {"Best_norm_ED":17s}: {best_norm_ED:0.4f}'
 
-                loss_model_log = f'{loss_log}\n{current_model_log}\n{best_model_log}'
-                print(loss_model_log)
-                log.write(loss_model_log + '\n')
+def main(config_path: str):
+    """Main training pipeline."""
+    config = load_config(config_path)
+    device = setup_device_and_seed(config)
 
-                # show some predicted results
-                dashed_line = '-' * 80
-                head = f'{"Ground Truth":25s} | {"Prediction":25s} | Confidence Score & T/F'
-                predicted_result_log = f'{dashed_line}\n{head}\n{dashed_line}\n'
-                
-                #show_number = min(show_number, len(labels))
-                
-                start = random.randint(0,len(labels) - show_number )    
-                for gt, pred, confidence in zip(labels[start:start+show_number], preds[start:start+show_number], confidence_score[start:start+show_number]):
-                    if 'Attn' in opt.Prediction:
-                        gt = gt[:gt.find('[s]')]
-                        pred = pred[:pred.find('[s]')]
+    # Setup directories and logging
+    exp_dir = Path('./saved_models') / config.experiment_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=exp_dir / 'runs')
 
-                    predicted_result_log += f'{gt:25s} | {pred:25s} | {confidence:0.4f}\t{str(pred == gt)}\n'
-                predicted_result_log += f'{dashed_line}'
-                print(predicted_result_log)
-                log.write(predicted_result_log + '\n')
-                print('validation time: ', time.time()-t1)
-                t1=time.time()
-        # save model per 1e+4 iter.
-        if (i + 1) % 1e+4 == 0:
-            torch.save(
-                model.state_dict(), f'./saved_models/{opt.experiment_name}/iter_{i+1}.pth')
+    # Setup data, model, and converter
+    train_dataset, valid_loader, data_opt = setup_data_loaders(config)
+    model, converter = setup_model(config, data_opt, device)
 
-        if i == opt.num_iter:
-            print('end the training')
-            sys.exit()
-        i += 1
+    # Setup loss function
+    if 'CTC' in config.model.Prediction.name:
+        criterion = nn.CTCLoss(zero_infinity=True).to(device)
+    else:
+        criterion = nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token
+
+    # Setup optimizer
+    opt_config = config.training.optimizer
+    if opt_config.type == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=opt_config.lr, betas=(opt_config.beta1, 0.999))
+    else:
+        optimizer = optim.Adadelta(model.parameters(), lr=opt_config.lr, rho=opt_config.rho, eps=opt_config.eps)
+
+    # Setup scheduler
+    scheduler = None
+    if config.training.scheduler.use:
+        sched_config = config.training.scheduler
+        if sched_config.type == 'StepLR':
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=sched_config.step_size, gamma=sched_config.gamma)
+        elif sched_config.type == 'CosineAnnealingLR':
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.training.num_iter)
+
+    # Setup AMP
+    scaler = GradScaler(enabled=config.training.amp)
+
+    # Training loop
+    start_iter = 0
+    best_accuracy = -1
+    best_norm_ED = -1
+    current_iter = start_iter
+
+    logger.info(f"Starting training for {config.training.num_iter} iterations.")
+    start_time = time.time()
+
+    while current_iter < config.training.num_iter:
+        current_iter = train_one_epoch(model, criterion, optimizer, scaler, train_dataset, device, converter, config,
+                                       writer, current_iter)
+
+        if current_iter % config.training.valInterval == 0:
+            val_loss, current_accuracy, current_norm_ED, _, _, _, _, _ = validation(
+                model, criterion, valid_loader, converter, data_opt, device
+            )
+            writer.add_scalar('Loss/val', val_loss, current_iter)
+            writer.add_scalar('Accuracy/val', current_accuracy, current_iter)
+            writer.add_scalar('NormED/val', current_norm_ED, current_iter)
+
+            logger.info(
+                f"Iter: {current_iter}/{config.training.num_iter} | Val Loss: {val_loss:.4f} | Accuracy: {current_accuracy:.2f}% | Norm ED: {current_norm_ED:.4f}")
+
+            if current_accuracy > best_accuracy:
+                best_accuracy = current_accuracy
+                torch.save(model.state_dict(), exp_dir / 'best_accuracy.pth')
+                logger.info(f"New best accuracy model saved at iteration {current_iter}")
+
+            if current_norm_ED > best_norm_ED:
+                best_norm_ED = current_norm_ED
+                torch.save(model.state_dict(), exp_dir / 'best_norm_ED.pth')
+
+        if scheduler:
+            scheduler.step()
+
+    total_time = time.time() - start_time
+    logger.info(f"Training finished in {total_time / 3600:.2f} hours.")
+    writer.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='Path to the configuration file (e.g., config.yaml)')
+    args = parser.parse_args()
+
+    main(args.config)
