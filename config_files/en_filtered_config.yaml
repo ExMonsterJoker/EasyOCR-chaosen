@@ -1,0 +1,46 @@
+number: '0123456789'
+symbol:  "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ €½¼¾⅛⅜⅝⅞"
+lang_char: ' ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+experiment_name: 'bn_filtered'
+train_data: 'all_data\train_data'
+valid_data: 'all_data\train_data'
+manualSeed: 1111
+workers: 2
+batch_size: 8 #32
+num_iter: 1000
+valInterval: 50
+saved_model: '' #'saved_models/en_filtered/iter_300000.pth'
+FT: False
+optim: 'adam' # default is Adadelta
+lr: 0.0001
+beta1: 0.9
+rho: 0.95
+eps: 0.00000001
+grad_clip: 5
+#Data processing
+select_data: 'all_data\train_data' # this is dataset folder in train_data
+batch_ratio: '1'
+total_data_usage_ratio: 0.5
+batch_max_length: 500 #34
+imgH: 48
+imgW: 1500
+rgb: False
+contrast_adjust: False
+sensitive: True
+PAD: True
+contrast_adjust: 0.0
+data_filtering_off: False
+# Model Architecture
+Transformation: 'None'
+FeatureExtraction: 'VGG'
+SequenceModeling: 'BiLSTM'
+Prediction: 'CTC'
+num_fiducial: 20
+input_channel: 1
+output_channel: 256
+hidden_size: 128
+decode: 'greedy'
+new_prediction: False
+freeze_FeatureFxtraction: False
+freeze_SequenceModeling: False
+
