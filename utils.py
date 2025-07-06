@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pickle
 import numpy as np
+import random
 from typing import List, Dict, Tuple, Optional, Union
 from pathlib import Path
 import logging
@@ -37,7 +38,7 @@ class CTCLabelConverter(object):
             if len(t) > batch_max_length:
                 t = t[:batch_max_length]
 
-            indices = [self.dict.get(char.lower(), 0) for char in t]
+            indices = [self.dict.get(char, 0) for char in t]  # Fixed: removed .lower()
             text_indices[i, :len(indices)] = torch.LongTensor(indices)
 
         return text_indices, torch.IntTensor(lengths)
@@ -86,7 +87,7 @@ class AttnLabelConverter(object):
             if len(t) > batch_max_length:
                 t = t[:batch_max_length]
 
-            text_sequence = [self.dict.get(char.lower(), self.dict[self.GO]) for char in t]
+            text_sequence = [self.dict.get(char, self.dict[self.GO]) for char in t]  # Fixed: removed .lower()
             text_sequence = [self.dict[self.GO]] + text_sequence + [self.dict[self.EOS]]
             batch_text[i, :len(text_sequence)] = torch.LongTensor(text_sequence)
 
@@ -132,6 +133,10 @@ class Averager(object):
             self.sum += val
         self.count += 1
         self.avg = self.sum / self.count
+
+    def val(self):
+        """Added method to get current average value."""
+        return self.avg
 
 
 # --- General Purpose Utilities ---

@@ -7,14 +7,13 @@ from typing import List, Tuple
 
 import numpy as np
 import cv2
-import lmdb
 import pandas as pd
 
 import torch
-from torch.utils.data import Dataset, ConcatDataset, Subset, DataLoader
+from torch.utils.data import Dataset, ConcatDataset, DataLoader
 from torchvision import transforms
 import torchvision.transforms.functional as TF
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -26,8 +25,7 @@ logger = logging.getLogger(__name__)
 
 class ModernBatchBalancedDataset:
     """
-    Modern implementation of a batch-balanced dataset for EasyOCR fine-tuning.
-    Supports multiple data sources with configurable ratios and advanced augmentations.
+    Modern implementation of a batch-balanced dataset for OCR training.
     """
 
     def __init__(self, opt):
@@ -73,7 +71,8 @@ class ModernBatchBalancedDataset:
                 imgH=self.opt.imgH,
                 imgW=self.opt.imgW,
                 keep_ratio_with_pad=self.opt.PAD,
-                augmentation=getattr(self.opt, 'augmentation', True)
+                augmentation=getattr(self.opt, 'augmentation', True),
+                rgb=self.opt.rgb
             ),
             pin_memory=True,
             persistent_workers=True if int(self.opt.workers) > 0 else False,
@@ -87,14 +86,12 @@ class ModernBatchBalancedDataset:
         """Create dataset based on the dataset name/path."""
         dataset_path = os.path.join(self.opt.train_data, dataset_name)
 
-        if os.path.isdir(dataset_path) and 'data.mdb' in os.listdir(dataset_path):
-            logger.info(f"Loading LMDB dataset from: {dataset_path}")
-            return ModernLmdbDataset(dataset_path, self.opt)
-        elif os.path.isfile(os.path.join(dataset_path, 'labels.csv')):
+        # Check if it's a CSV-based dataset
+        if os.path.isfile(os.path.join(dataset_path, 'labels.csv')):
             logger.info(f"Loading CSV-based dataset from: {dataset_path}")
             return ModernOCRDataset(dataset_path, self.opt)
         else:
-            raise ValueError(f"Unknown or invalid dataset format for {dataset_path}")
+            raise ValueError(f"Dataset not found or invalid format for {dataset_path}")
 
     def get_batch(self) -> Tuple[torch.Tensor, List[str]]:
         """Get a batch from the data loader."""
@@ -116,74 +113,6 @@ class ModernBatchBalancedDataset:
         """Cleanup."""
         if hasattr(self, 'log_file'):
             self.log_file.close()
-
-
-class ModernLmdbDataset(Dataset):
-    """Modern LMDB dataset implementation with better error handling."""
-
-    def __init__(self, root: str, opt):
-        self.root = root
-        self.opt = opt
-
-        try:
-            self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
-        except lmdb.Error as e:
-            logger.error(f'Cannot create LMDB from {root}: {e}')
-            raise
-
-        with self.env.begin(write=False) as txn:
-            self.nSamples = int(txn.get('num-samples'.encode()).decode())
-            self.filtered_index_list = self._filter_samples(txn)
-
-        logger.info(
-            f'LMDB Dataset {os.path.basename(root)}: {len(self.filtered_index_list)}/{self.nSamples} samples loaded.')
-
-    def _filter_samples(self, txn) -> List[int]:
-        """Filter samples based on length and character constraints."""
-        filtered_indices = []
-        for index in range(1, self.nSamples + 1):  # LMDB is 1-indexed
-            label_key = f'label-{index:09d}'.encode()
-            label_bytes = txn.get(label_key)
-            if label_bytes is None:
-                continue
-            label = label_bytes.decode('utf-8')
-
-            if len(label) > self.opt.batch_max_length or len(label) == 0:
-                continue
-
-            if not self.opt.data_filtering_off and hasattr(self.opt, 'character'):
-                pattern = f'[^{re.escape(self.opt.character)}]'
-                if re.search(pattern, label.lower()):
-                    continue
-
-            filtered_indices.append(index)
-        return filtered_indices
-
-    def __len__(self) -> int:
-        return len(self.filtered_index_list)
-
-    def __getitem__(self, index: int) -> Tuple[np.ndarray, str]:
-        real_index = self.filtered_index_list[index]
-        with self.env.begin(write=False) as txn:
-            label_key = f'label-{real_index:09d}'.encode()
-            label = txn.get(label_key).decode('utf-8')
-            img_key = f'image-{real_index:09d}'.encode()
-            imgbuf = txn.get(img_key)
-
-            buf = np.frombuffer(imgbuf, dtype=np.uint8)
-            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError(f"Cannot decode image at index {real_index} in {self.root}")
-
-            if self.opt.rgb:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        if not getattr(self.opt, 'sensitive', True):
-            label = label.lower()
-
-        return img, label
 
 
 class ModernOCRDataset(Dataset):
@@ -210,8 +139,10 @@ class ModernOCRDataset(Dataset):
         df = df[df['words'].str.len() > 0]
 
         if not self.opt.data_filtering_off and hasattr(self.opt, 'character'):
-            pattern = f'[^{re.escape(self.opt.character)}]'
-            df = df[~df['words'].str.lower().str.contains(pattern, regex=True)]
+            # Create character set from character_list
+            valid_chars = set(self.opt.character)
+            # Filter out samples with invalid characters
+            df = df[df['words'].apply(lambda x: all(c in valid_chars for c in x))]
 
         return df.reset_index(drop=True)
 
@@ -221,13 +152,14 @@ class ModernOCRDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[np.ndarray, str]:
         row = self.filtered_df.iloc[index]
         img_fname = row['filename']
-        img_fpath = os.path.join(self.root, 'images', img_fname)
+        img_fpath = os.path.join(self.root, img_fname)  # Images are in the same folder
         label = row['words']
 
         try:
             if self.opt.rgb:
                 img = cv2.imread(img_fpath)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             else:
                 img = cv2.imread(img_fpath, cv2.IMREAD_GRAYSCALE)
             if img is None:
@@ -246,30 +178,33 @@ class ModernOCRDataset(Dataset):
 class ModernAlignCollate:
     """Modern collate function with advanced augmentations using Albumentations."""
 
-    def __init__(self, imgH: int = 32, imgW: int = 100, keep_ratio_with_pad: bool = False, augmentation: bool = True):
+    def __init__(self, imgH: int = 32, imgW: int = 100, keep_ratio_with_pad: bool = False,
+                 augmentation: bool = True, rgb: bool = True):
         self.imgH = imgH
         self.imgW = imgW
         self.keep_ratio_with_pad = keep_ratio_with_pad
         self.augmentation = augmentation
+        self.rgb = rgb
 
         # Common transforms
-        self.normalize = A.Normalize(mean=[0.5], std=[0.5])
+        if rgb:
+            self.normalize = A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        else:
+            self.normalize = A.Normalize(mean=[0.5], std=[0.5])
 
         # Augmentation pipeline
         if augmentation:
             self.augment = A.Compose([
                 A.OneOf([
-                    A.MotionBlur(blur_limit=5, p=0.5),
-                    A.GaussianBlur(blur_limit=5, p=0.5),
-                    A.GlassBlur(sigma=0.2, max_delta=2, p=0.3),
-                ], p=0.4),
+                    A.MotionBlur(blur_limit=3, p=0.5),
+                    A.GaussianBlur(blur_limit=3, p=0.5),
+                ], p=0.3),
                 A.OneOf([
-                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
-                    A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=25, p=0.4),
-                ], p=0.5),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-                A.Perspective(scale=(0.02, 0.08), pad_mode=cv2.BORDER_REPLICATE, p=0.4),
-                A.Affine(scale=(0.8, 1.2), translate_percent=(-0.1, 0.1), rotate=(-5, 5), shear=(-5, 5), p=0.5),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
+                    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=15, p=0.4),
+                ], p=0.4),
+                A.GaussNoise(var_limit=(10.0, 30.0), p=0.2),
+                A.Affine(scale=(0.9, 1.1), translate_percent=(-0.05, 0.05), rotate=(-3, 3), p=0.3),
                 self.normalize,
                 ToTensorV2()
             ])
@@ -287,38 +222,40 @@ class ModernAlignCollate:
             return torch.Tensor(), []
 
         images, labels = zip(*batch)
-
         processed_images = []
+
         for img in images:
+            # Handle grayscale conversion if needed
+            if not self.rgb and len(img.shape) == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            elif self.rgb and len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
             if self.keep_ratio_with_pad:
                 h, w = img.shape[:2]
                 ratio = w / h
                 new_w = int(ratio * self.imgH)
 
-                # Resize and apply augmentations
-                resize_aug = A.Compose([
-                    A.Resize(height=self.imgH, width=new_w),
-                    self.augment.transforms[0]  # Apply augmentations before padding
-                ])
-                processed = resize_aug(image=img)['image']
+                # Resize maintaining aspect ratio
+                img_resized = cv2.resize(img, (new_w, self.imgH))
+
+                # Apply augmentations
+                augmented = self.augment(image=img_resized)['image']
 
                 # Pad to target width
-                c, h, w = processed.shape
+                c, h, w = augmented.shape
                 pad_width = self.imgW - w
                 if pad_width > 0:
-                    processed = TF.pad(processed, [0, 0, pad_width, 0], fill=0)
+                    augmented = TF.pad(augmented, [0, 0, pad_width, 0], fill=0)
                 elif pad_width < 0:  # If wider than target, resize again
-                    processed = TF.resize(processed, [self.imgH, self.imgW])
+                    augmented = TF.resize(augmented, [self.imgH, self.imgW])
 
-                processed_images.append(processed)
+                processed_images.append(augmented)
             else:
-                # Resize directly to target size and augment
-                resize_aug = A.Compose([
-                    A.Resize(height=self.imgH, width=self.imgW),
-                    self.augment
-                ])
-                processed = resize_aug(image=img)['image']
-                processed_images.append(processed)
+                # Resize directly to target size
+                img_resized = cv2.resize(img, (self.imgW, self.imgH))
+                augmented = self.augment(image=img_resized)['image']
+                processed_images.append(augmented)
 
         image_tensors = torch.stack(processed_images)
         return image_tensors, list(labels)
@@ -326,8 +263,10 @@ class ModernAlignCollate:
 
 # Legacy compatibility functions
 def hierarchical_dataset(root, opt):
-    return ModernOCRDataset(root, opt), ""  # Simplified for modern use
+    """Create a dataset from the root directory."""
+    return ModernOCRDataset(root, opt), ""
 
 
+# Legacy compatibility aliases
 Batch_Balanced_Dataset = ModernBatchBalancedDataset
 AlignCollate = ModernAlignCollate

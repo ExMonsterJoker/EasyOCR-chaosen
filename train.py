@@ -27,10 +27,20 @@ logger = logging.getLogger(__name__)
 
 def load_config(config_path: str) -> AttrDict:
     """Load configuration from a YAML file."""
+    def dict_to_attrdict(d):
+        """Recursively convert nested dictionaries to AttrDict objects."""
+        if isinstance(d, dict):
+            return AttrDict({k: dict_to_attrdict(v) for k, v in d.items()})
+        elif isinstance(d, list):
+            return [dict_to_attrdict(item) for item in d]
+        else:
+            return d
+    
     # Corrected to specify UTF-8 encoding to prevent UnicodeDecodeError on Windows.
     with open(config_path, 'r', encoding='utf-8') as f:
         config_dict = yaml.safe_load(f)
-    return AttrDict(config_dict)
+    
+    return dict_to_attrdict(config_dict)
 
 
 def setup_device_and_seed(config: AttrDict):
