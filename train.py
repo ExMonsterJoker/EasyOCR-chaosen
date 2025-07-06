@@ -184,6 +184,8 @@ def main(config_path: str):
     opt_config = config.training.optimizer
     if opt_config.type == 'adam':
         optimizer = optim.Adam(model.parameters(), lr=opt_config.lr, betas=(opt_config.beta1, 0.999))
+    elif opt_config.type == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=opt_config.lr, betas=(opt_config.beta1, 0.999))
     else:
         optimizer = optim.Adadelta(model.parameters(), lr=opt_config.lr, rho=opt_config.rho, eps=opt_config.eps)
 
@@ -195,6 +197,16 @@ def main(config_path: str):
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=sched_config.step_size, gamma=sched_config.gamma)
         elif sched_config.type == 'CosineAnnealingLR':
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.training.num_iter)
+        elif sched_config.type == 'OneCycleLR':
+            steps_per_epoch = len(train_dataset) // config.training.batch_size
+            total_epochs = max(1, config.training.num_iter // steps_per_epoch)  # Ensure at least 1 epoch
+            scheduler = optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=opt_config.lr,
+                steps_per_epoch=steps_per_epoch,
+                epochs=total_epochs,
+                pct_start=sched_config.pct_start
+            )
 
     # Setup AMP
     scaler = GradScaler(enabled=config.training.amp)
